@@ -70,8 +70,7 @@ function getNodeReleaseStatus(
 function getMajorNodeReleases() {
   return Object.entries(nodevuDataTyped).filter(([version, { support }]) => {
     if (!support) return false;
-    if (version.startsWith("v0.") && version !== "v0.12") return false;
-    return true;
+    return !(version.startsWith("v0.") && version !== "v0.12");
   });
 }
 
@@ -176,7 +175,8 @@ function flagValue(flag: string, fallback: string): string {
 
 function majorsArg(): number[] {
   const value = flagValue("--majors", process.env.NODE_MAJOR_VERSIONS_TO_CHECK || "");
-  return value.split(",").map((m) => Number(m)).filter((m) => !Number.isNaN(m));
+  return value.split(",").map((m) => m.trim()).filter(Boolean)
+    .map(Number).filter((m) => Number.isInteger(m) && m > 0);
 }
 
 const alpineCache = new Map<number, string>();
@@ -280,6 +280,8 @@ async function syncDockerfiles(): Promise<{ created: number[]; updated: number[]
   const supported = await resolveSupportedMajors();
   const created: number[] = [];
   const updated: number[] = [];
+  const state = await loadVersionsState(versionsFilePath());
+  const releases = await generateReleaseData();
 
   const templates = await readTemplates();
   const entrypoint = await readFile(join("templates", "docker-entrypoint.sh"), "utf8");
@@ -317,6 +319,7 @@ async function syncDockerfiles(): Promise<{ created: number[]; updated: number[]
     if (existingEntrypoint !== entrypoint) {
       await writeFile(join(dir, "docker-entrypoint.sh"), entrypoint);
       await $`chmod +x ${join(dir, "docker-entrypoint.sh")}`;
+      track(major, isNew ? created : updated);
     }
   };
 
@@ -334,6 +337,13 @@ async function syncDockerfiles(): Promise<{ created: number[]; updated: number[]
         isNew = true;
       }
       await ensureDir(dir, template, major, alpine, isNew);
+    }
+    const release = releases.find((release) => release.major === major)!;
+    // The Dockerfiles use floating major tags: a new Node release changes the
+    // build inputs even when the rendered files are identical. Keep the last
+    // built version in state until the release workflow successfully builds it.
+    if (!created.includes(major) && state.nodejs[String(major)]?.version !== release.versionWithPrefix) {
+      track(major, updated);
     }
   }
 
@@ -368,7 +378,6 @@ async function syncDockerfiles(): Promise<{ created: number[]; updated: number[]
   );
 
   if (created.length > 0 || updated.length > 0) {
-    const state = await loadVersionsState(versionsFilePath());
     const rebuild = new Set<string>(state._needs_rebuild || []);
     for (const major of [...created, ...updated]) rebuild.add(String(major));
     state._needs_rebuild = [...rebuild];
@@ -409,7 +418,7 @@ async function matrixFromForcedInputs(
   releases: NodeRelease[],
   availableReleases: NodeRelease[],
   distros: string[]
-): Promise<Array<Record<string, string | number>>> {
+): Promise<Array<Record<string, string | number | boolean>>> {
   const forcedBun = process.env.INPUT_BUN_VERSIONS || "";
   const forcedNode = process.env.INPUT_NODE_VERSIONS || "";
   const bunVersions = forcedBun
@@ -421,7 +430,7 @@ async function matrixFromForcedInputs(
   const releaseByVersion = new Map(releases.map((r) => [r.version, r]));
   const releaseByMajor = new Map(releases.map((r) => [r.major, r]));
 
-  const include: Array<Record<string, string | number>> = [];
+  const include: Array<Record<string, string | number | boolean>> = [];
   for (const bunVersion of bunVersions) {
     const tag = bunVersion.includes("-canary") ? "canary" : "latest";
     const nodeVersions = forcedNodeVersions.length > 0 ? forcedNodeVersions : availableReleases.map((r) => r.version);
@@ -448,8 +457,8 @@ async function matrixFromStateDiff(
   bunTags: string[],
   availableReleases: NodeRelease[],
   distros: string[]
-): Promise<Array<Record<string, string | number>>> {
-  const include: Array<Record<string, string | number>> = [];
+): Promise<Array<Record<string, string | number | boolean>>> {
+  const include: Array<Record<string, string | number | boolean>> = [];
   const maxMajor = Math.max(...availableReleases.map((r) => r.major), 0);
 
   for (const tag of bunTags) {
