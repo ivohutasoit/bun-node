@@ -176,9 +176,20 @@ function flagValue(flag: string, fallback: string): string {
 }
 
 function majorsArg(): number[] {
-  const value = flagValue("--majors", process.env.NODE_MAJOR_VERSIONS_TO_CHECK || "");
-  return value.split(",").map((m) => m.trim()).filter(Boolean)
-    .map(Number).filter((m) => Number.isInteger(m) && m > 0);
+  const argIndex = process.argv.findIndex((arg) => arg === "--majors" || arg.startsWith("--majors="));
+  const value = argIndex === -1
+    ? process.env.NODE_MAJOR_VERSIONS_TO_CHECK || ""
+    : process.argv[argIndex] === "--majors"
+      ? process.argv[argIndex + 1] || ""
+      : process.argv[argIndex]!.slice("--majors=".length);
+  if (argIndex === -1 && value === "") return [];
+
+  const values = value.split(",").map((major) => major.trim());
+  const majors = values.map(Number);
+  if (values.some((major) => !/^\d+$/.test(major)) || majors.some((major) => !Number.isSafeInteger(major) || major <= 0)) {
+    throw new Error("Invalid --majors: expected a comma-separated list of positive integers.");
+  }
+  return majors;
 }
 
 const alpineCache = new Map<number, string>();
@@ -206,7 +217,7 @@ async function getDockerNodeTag(major: number, pattern: RegExp): Promise<string 
     if (!response.ok) {
       throw new Error(`docker hub request failed for node ${major}: ${response.status}`);
     }
-    const data = (await response.json()) as { results: Array<{ name: string }>; next: string | null };
+    const data = (await response.json()) as { results: Array<{ name: string }>; next: string | null }; // NOSONAR: Read this page before requesting the next one.
     for (const result of data.results) names.push(result.name);
     next = data.next || "";
   }
@@ -390,11 +401,11 @@ async function syncDockerfiles(): Promise<{ created: number[]; updated: number[]
 }
 
 async function generateMatrix(): Promise<void> {
+  const explicitMajors = majorsArg();
   const releases = generateReleaseData();
   const state = await loadVersionsState(versionsFilePath());
 
   const supportedMajorsList = await resolveSupportedMajors();
-  const explicitMajors = majorsArg();
   const majors = explicitMajors.length > 0 ? explicitMajors : supportedMajorsList.map((s) => s.major);
   const availableReleases = releases.filter(
     (r) => majors.includes(r.major) && supportedMajorsList.some((s) => s.major === r.major)
